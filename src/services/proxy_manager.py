@@ -120,6 +120,16 @@ class ProxyManager:
             return config.proxy_url
         return None
 
+    async def resolve_account_proxy_url(
+        self,
+        account_proxy_url: Optional[str] = None
+    ) -> Optional[str]:
+        """Resolve Flow request proxy: account-level first, then global request proxy."""
+        normalized = self.normalize_proxy_url(account_proxy_url)
+        if normalized:
+            return normalized
+        return await self.get_request_proxy_url()
+
     async def get_media_proxy_url(self) -> Optional[str]:
         """Get media upload/download proxy URL, fallback to request proxy"""
         config = await self.db.get_proxy_config()

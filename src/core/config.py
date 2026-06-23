@@ -133,26 +133,6 @@ class Config:
             return 0.8
 
     @property
-    def flow_image_timeout_use_media_proxy_fallback(self) -> bool:
-        """网络超时时是否切换媒体代理重试。"""
-        return bool(
-            self._config.get("flow", {}).get(
-                "image_timeout_use_media_proxy_fallback",
-                True
-            )
-        )
-
-    @property
-    def flow_image_prefer_media_proxy(self) -> bool:
-        """图片生成是否优先走媒体代理链路。"""
-        return bool(
-            self._config.get("flow", {}).get(
-                "image_prefer_media_proxy",
-                False
-            )
-        )
-
-    @property
     def flow_image_slot_wait_timeout(self) -> float:
         """图片硬并发槽位等待超时(秒)。"""
         timeout = self._config.get("flow", {}).get("image_slot_wait_timeout", 120)

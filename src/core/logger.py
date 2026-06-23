@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 from .config import config
 
 class DebugLogger:
@@ -48,6 +49,27 @@ class DebugLogger:
         if not config.debug_mask_token or len(token) <= 12:
             return token
         return f"{token[:6]}...{token[-6:]}"
+
+    def mask_proxy_url(self, proxy_url: Optional[str]) -> Optional[str]:
+        if not proxy_url:
+            return proxy_url
+        if not config.debug_mask_token:
+            return proxy_url
+        try:
+            parsed = urlsplit(str(proxy_url))
+            if not parsed.scheme or not parsed.netloc:
+                return proxy_url
+            host = parsed.hostname or ""
+            if not host:
+                return proxy_url
+            netloc = host
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            if parsed.username:
+                netloc = f"{parsed.username}:***@{netloc}"
+            return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+        except Exception:
+            return "<masked-proxy>"
 
     def _format_timestamp(self) -> str:
         """Format current timestamp"""
@@ -151,7 +173,7 @@ class DebugLogger:
 
             # Proxy
             if proxy:
-                self.logger.info(f"\n🌐 Proxy: {proxy}")
+                self.logger.info(f"\n🌐 Proxy: {self.mask_proxy_url(proxy)}")
 
             self._write_separator()
             self.logger.info("")  # Empty line

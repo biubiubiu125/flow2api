@@ -427,6 +427,7 @@ class Database:
                     ("image_concurrency", "INTEGER DEFAULT -1"),
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("captcha_proxy_url", "TEXT"),  # token级打码代理
+                    ("account_proxy_url", "TEXT"),  # token级Flow请求代理
                     ("extension_route_key", "TEXT"),  # extension 模式路由键
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
@@ -589,6 +590,7 @@ class Database:
                     image_concurrency INTEGER DEFAULT -1,
                     video_concurrency INTEGER DEFAULT -1,
                     captcha_proxy_url TEXT,
+                    account_proxy_url TEXT,
                     extension_route_key TEXT,
                     ban_reason TEXT,
                     banned_at TIMESTAMP
@@ -871,14 +873,14 @@ class Database:
                 INSERT INTO tokens (st, at, at_expires, email, name, remark, is_active,
                                    credits, user_paygate_tier, current_project_id, current_project_name,
                                    image_enabled, video_enabled, image_concurrency, video_concurrency,
-                                   captcha_proxy_url, extension_route_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   captcha_proxy_url, account_proxy_url, extension_route_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
                   token.image_enabled, token.video_enabled,
                   token.image_concurrency, token.video_concurrency,
-                  token.captcha_proxy_url, token.extension_route_key))
+                  token.captcha_proxy_url, token.account_proxy_url, token.extension_route_key))
             await db.commit()
             token_id = cursor.lastrowid
 
@@ -914,7 +916,27 @@ class Database:
         """Get token by email"""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM tokens WHERE email = ?", (email,))
+            cursor = await db.execute(
+                "SELECT * FROM tokens WHERE email = ? ORDER BY created_at DESC LIMIT 1",
+                (email,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return Token(**dict(row))
+            return None
+
+    async def get_token_by_extension_route_key(self, extension_route_key: str) -> Optional[Token]:
+        """Get token by extension route key"""
+        route_key = (extension_route_key or "").strip()
+        if not route_key:
+            return None
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM tokens WHERE extension_route_key = ? ORDER BY created_at DESC LIMIT 1",
+                (route_key,)
+            )
             row = await cursor.fetchone()
             if row:
                 return Token(**dict(row))

@@ -1437,7 +1437,9 @@ class GenerationHandler:
                         token.at,
                         image_bytes,
                         model_config["aspect_ratio"],
-                        project_id=project_id
+                        project_id=project_id,
+                        token_id=token.id,
+                        account_proxy_url=token.account_proxy_url
                     )
                     image_inputs.append({
                         "name": media_id,
@@ -1474,6 +1476,7 @@ class GenerationHandler:
                 token_id=token.id,
                 token_image_concurrency=token.image_concurrency,
                 progress_callback=_image_progress_callback,
+                account_proxy_url=token.account_proxy_url,
             )
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
@@ -1525,7 +1528,8 @@ class GenerationHandler:
                             target_resolution=upsample_resolution,
                             user_paygate_tier=normalized_tier,
                             session_id=generation_session_id,
-                            token_id=token.id
+                            token_id=token.id,
+                            account_proxy_url=token.account_proxy_url
                         )
 
                         if encoded_image:
@@ -1774,7 +1778,9 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk("上传首帧图片...\n")
                     start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id
+                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id,
+                        token_id=token.id,
+                        account_proxy_url=token.account_proxy_url
                     )
                     debug_logger.log_info(f"[I2V] 仅上传首帧: {start_media_id}")
 
@@ -1783,10 +1789,14 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk("上传首帧和尾帧图片...\n")
                     start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id
+                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id,
+                        token_id=token.id,
+                        account_proxy_url=token.account_proxy_url
                     )
                     end_media_id = await self.flow_client.upload_image(
-                        token.at, images[1], model_config["aspect_ratio"], project_id=project_id
+                        token.at, images[1], model_config["aspect_ratio"], project_id=project_id,
+                        token_id=token.id,
+                        account_proxy_url=token.account_proxy_url
                     )
                     debug_logger.log_info(f"[I2V] 上传首尾帧: {start_media_id}, {end_media_id}")
 
@@ -1797,7 +1807,9 @@ class GenerationHandler:
 
                 for img in images:
                     media_id = await self.flow_client.upload_image(
-                        token.at, img, model_config["aspect_ratio"], project_id=project_id
+                        token.at, img, model_config["aspect_ratio"], project_id=project_id,
+                        token_id=token.id,
+                        account_proxy_url=token.account_proxy_url
                     )
                     reference_images.append({
                         "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
@@ -1826,6 +1838,7 @@ class GenerationHandler:
                         user_paygate_tier=normalized_tier,
                         token_id=token.id,
                         token_video_concurrency=token.video_concurrency,
+                        account_proxy_url=token.account_proxy_url,
                     )
                 else:
                     # 只有首帧 - 需要去掉 model_key 中的 _fl
@@ -1846,6 +1859,7 @@ class GenerationHandler:
                         user_paygate_tier=normalized_tier,
                         token_id=token.id,
                         token_video_concurrency=token.video_concurrency,
+                        account_proxy_url=token.account_proxy_url,
                     )
 
             # R2V: 多图生成
@@ -1860,6 +1874,7 @@ class GenerationHandler:
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
+                    account_proxy_url=token.account_proxy_url,
                 )
 
             # Extend: 视频续写
@@ -1885,6 +1900,7 @@ class GenerationHandler:
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
+                    account_proxy_url=token.account_proxy_url,
                 )
 
             # T2V 或 R2V无图: 纯文本生成
@@ -1899,6 +1915,7 @@ class GenerationHandler:
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
+                    account_proxy_url=token.account_proxy_url,
                 )
             if video_trace is not None:
                 video_trace["submit_generation_ms"] = int((time.time() - submit_started_at) * 1000)
@@ -1993,7 +2010,11 @@ class GenerationHandler:
             await asyncio.sleep(poll_interval)
 
             try:
-                result = await self.flow_client.check_video_status(token.at, operations)
+                result = await self.flow_client.check_video_status(
+                    token.at,
+                    operations,
+                    account_proxy_url=token.account_proxy_url
+                )
                 checked_operations = result.get("operations", [])
                 consecutive_poll_errors = 0
                 last_poll_error = None
@@ -2049,6 +2070,7 @@ class GenerationHandler:
                                 model_key=upsample_config["model_key"],
                                 token_id=token.id,
                                 token_video_concurrency=token.video_concurrency,
+                                account_proxy_url=token.account_proxy_url,
                             )
                             
                             upsample_operations = upsample_result.get("operations", [])
@@ -2089,6 +2111,7 @@ class GenerationHandler:
                                 at=token.at,
                                 original_media_id=extend_source_media_id,
                                 extend_media_id=video_media_id,
+                                account_proxy_url=token.account_proxy_url,
                             )
                             
                             # 获取 operation name
@@ -2103,6 +2126,7 @@ class GenerationHandler:
                                     operation_name=concat_op,
                                     timeout=300,
                                     poll_interval=3,
+                                    account_proxy_url=token.account_proxy_url,
                                 )
                                 
                                 concat_url = concat_status.get("outputUri", "")

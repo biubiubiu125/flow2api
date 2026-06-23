@@ -1483,6 +1483,12 @@ class BrowserCaptchaService:
         self._proxy_url: Optional[str] = None
         self._proxy_ext_dir: Optional[str] = None
         self._proxy_config_signature: str = ""
+        self._account_proxy_url_override: Optional[str] = None
+        self._account_proxy_override_lock = asyncio.Lock()
+        self._proxy_mode_condition = asyncio.Condition()
+        self._default_proxy_use_count = 0
+        self._account_proxy_use_active = False
+        self._account_proxy_use_pending = 0
         self._recaptcha_script_cache_dir = _get_recaptcha_script_cache_dir()
         self._recaptcha_script_cache_lock = asyncio.Lock()
         self._recaptcha_asset_cache_dir = _get_recaptcha_asset_cache_dir()
@@ -1924,6 +1930,7 @@ class BrowserCaptchaService:
         )
 
         signature_payload = {
+            "account_proxy_url_override": str(self._account_proxy_url_override or "").strip(),
             "captcha_browser_proxy_enabled": bool(getattr(captcha_cfg, "browser_proxy_enabled", False)),
             "captcha_browser_proxy_url": str(getattr(captcha_cfg, "browser_proxy_url", "") or "").strip(),
             "captcha_browser_proxy_pool": normalize_pool(getattr(captcha_cfg, "browser_proxy_pool", "")),
@@ -8103,11 +8110,86 @@ class BrowserCaptchaService:
                 )
         await self._cleanup_runtime_profile_dirs_after_shutdown(reason=reason)
 
+    def _normalize_account_proxy_override(self, account_proxy_url: Optional[str]) -> Optional[str]:
+        raw = str(account_proxy_url or "").strip()
+        if not raw:
+            return None
+        try:
+            from .proxy_manager import ProxyManager
+            normalized = ProxyManager(self.db).normalize_proxy_url(raw)
+        except Exception as e:
+            raise ValueError(f"Invalid account proxy for personal browser: {e}") from e
+
+        protocol, host, port, username, password = _parse_proxy_url(normalized or "")
+        normalized = _compose_proxy_url(protocol, host, port, username, password)
+        if not normalized:
+            raise ValueError("Invalid account proxy for personal browser")
+        return normalized
+
+    async def _apply_account_proxy_override(
+        self,
+        account_proxy_url: Optional[str],
+        *,
+        reason: str,
+    ) -> None:
+        normalized = self._normalize_account_proxy_override(account_proxy_url)
+        if normalized == self._account_proxy_url_override:
+            return
+
+        self._account_proxy_url_override = normalized
+        new_signature = await self._build_proxy_config_signature()
+        if self._initialized or self.browser:
+            async with self._browser_lock:
+                await self._shutdown_browser_runtime_locked(
+                    reason=f"{reason}_account_proxy_changed"
+                )
+        self._proxy_config_signature = new_signature
+
+    async def _enter_default_proxy_mode(self) -> None:
+        async with self._proxy_mode_condition:
+            while self._account_proxy_use_active or self._account_proxy_use_pending > 0:
+                await self._proxy_mode_condition.wait()
+            self._default_proxy_use_count += 1
+
+    async def _exit_default_proxy_mode(self) -> None:
+        async with self._proxy_mode_condition:
+            self._default_proxy_use_count = max(0, self._default_proxy_use_count - 1)
+            if self._default_proxy_use_count == 0:
+                self._proxy_mode_condition.notify_all()
+
+    async def _enter_account_proxy_mode(self) -> None:
+        async with self._proxy_mode_condition:
+            self._account_proxy_use_pending += 1
+            try:
+                while self._account_proxy_use_active or self._default_proxy_use_count > 0:
+                    await self._proxy_mode_condition.wait()
+                self._account_proxy_use_active = True
+            finally:
+                self._account_proxy_use_pending = max(0, self._account_proxy_use_pending - 1)
+
+    async def _exit_account_proxy_mode(self) -> None:
+        async with self._proxy_mode_condition:
+            self._account_proxy_use_active = False
+            self._proxy_mode_condition.notify_all()
+
     async def _resolve_personal_proxy(self):
         """Read proxy config for personal captcha browser.
-        Priority: captcha browser_proxy > request proxy."""
+        Priority: account override > captcha browser_proxy > request proxy."""
         if not self.db:
             return None, None, None, None, None
+        account_proxy_url = str(self._account_proxy_url_override or "").strip()
+        if account_proxy_url:
+            protocol, host, port, username, password = _parse_proxy_url(account_proxy_url)
+            if protocol and host and port:
+                debug_logger.log_info(
+                    "[BrowserCaptcha] Personal uses account proxy for token refresh: "
+                    f"{debug_logger.mask_proxy_url(account_proxy_url)}"
+                )
+                return protocol, host, port, username, password
+            debug_logger.log_warning(
+                "[BrowserCaptcha] Account proxy format is invalid, falling back: "
+                f"{debug_logger.mask_proxy_url(account_proxy_url)}"
+            )
         try:
             captcha_cfg = await self.db.get_captcha_config()
             browser_proxy_pool = str(getattr(captcha_cfg, "browser_proxy_pool", "") or "").strip()
@@ -9139,9 +9221,13 @@ class BrowserCaptchaService:
         if not str(project_id or "").strip():
             debug_logger.log_warning("[BrowserCaptcha] 启动常驻模式失败：project_id 为空")
             return
-        self._mark_runtime_active()
-        await self.initialize()
-        debug_logger.log_info(f"[BrowserCaptcha] 浏览器已就绪 (project: {project_id})")
+        await self._enter_default_proxy_mode()
+        try:
+            self._mark_runtime_active()
+            await self.initialize()
+            debug_logger.log_info(f"[BrowserCaptcha] 浏览器已就绪 (project: {project_id})")
+        finally:
+            await self._exit_default_proxy_mode()
 
     async def stop_resident_mode(self, project_id: Optional[str] = None):
         """停止常驻模式
@@ -10324,6 +10410,29 @@ class BrowserCaptchaService:
         allow_affinity: bool = True,
         remember_affinity: bool = True,
     ) -> Optional[str] | tuple[Optional[str], Optional[str]]:
+        await self._enter_default_proxy_mode()
+        try:
+            return await self._get_token_direct_in_default_proxy_mode(
+                project_id,
+                action=action,
+                token_id=token_id,
+                return_slot_id=return_slot_id,
+                allow_affinity=allow_affinity,
+                remember_affinity=remember_affinity,
+            )
+        finally:
+            await self._exit_default_proxy_mode()
+
+    async def _get_token_direct_in_default_proxy_mode(
+        self,
+        project_id: str,
+        action: str = "IMAGE_GENERATION",
+        token_id: Optional[int] = None,
+        *,
+        return_slot_id: bool = False,
+        allow_affinity: bool = True,
+        remember_affinity: bool = True,
+    ) -> Optional[str] | tuple[Optional[str], Optional[str]]:
         """获取 reCAPTCHA token
 
         使用全局共享打码标签页池。标签页不再按 project_id 一对一绑定，
@@ -11030,11 +11139,23 @@ class BrowserCaptchaService:
 
         return None
 
-    def get_last_fingerprint(self) -> Optional[Dict[str, Any]]:
+    def get_last_fingerprint(self, token_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """返回最近一次打码时的浏览器指纹快照。"""
         if not self._last_fingerprint:
             return None
         return dict(self._last_fingerprint)
+
+    def get_token_fingerprint(self, token_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        token_key = self._normalize_token_key(token_id)
+        if not token_key:
+            return self.get_last_fingerprint()
+        slot_id = self._token_resident_affinity.get(token_key)
+        resident_info = self._resident_tabs.get(slot_id) if slot_id else None
+        if not resident_info or resident_info.token_id != int(token_key):
+            return None
+        if resident_info.fingerprint:
+            return dict(resident_info.fingerprint)
+        return None
 
     async def _clear_browser_cache(self):
         """清理浏览器全部缓存"""
@@ -11107,18 +11228,27 @@ class BrowserCaptchaService:
 
     async def open_login_window(self):
         """打开登录窗口供用户手动登录 Google"""
-        await self.initialize()
-        self._mark_runtime_active()
-        tab = await self._open_visible_browser_tab(
-            "https://accounts.google.com/",
-            label="open_login_window",
-        )
+        await self._enter_default_proxy_mode()
+        try:
+            await self.initialize()
+            self._mark_runtime_active()
+            tab = await self._open_visible_browser_tab(
+                "https://accounts.google.com/",
+                label="open_login_window",
+            )
+        finally:
+            await self._exit_default_proxy_mode()
         debug_logger.log_info("[BrowserCaptcha] 请在打开的浏览器中登录账号。登录完成后，无需关闭浏览器，脚本下次运行时会自动使用此状态。")
         print("请在打开的浏览器中登录账号。登录完成后，无需关闭浏览器，脚本下次运行时会自动使用此状态。")
 
     # ========== Session Token 刷新 ==========
 
-    async def refresh_session_token(self, project_id: str, token_id: Optional[int] = None) -> Optional[str]:
+    async def refresh_session_token(
+        self,
+        project_id: str,
+        token_id: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
+    ) -> Optional[str]:
         """从常驻标签页获取最新的 Session Token
         
         复用共享打码标签页，通过刷新页面并从 cookies 中提取
@@ -11130,6 +11260,33 @@ class BrowserCaptchaService:
         Returns:
             新的 Session Token，如果获取失败返回 None
         """
+        await self._enter_account_proxy_mode()
+        try:
+            async with self._account_proxy_override_lock:
+                previous_account_proxy_url = self._account_proxy_url_override
+                await self._apply_account_proxy_override(
+                    account_proxy_url,
+                    reason="refresh_session_token",
+                )
+
+                try:
+                    return await self._refresh_session_token_with_current_proxy(
+                        project_id,
+                        token_id=token_id,
+                    )
+                finally:
+                    await self._apply_account_proxy_override(
+                        previous_account_proxy_url,
+                        reason="refresh_session_token_restore",
+                    )
+        finally:
+            await self._exit_account_proxy_mode()
+
+    async def _refresh_session_token_with_current_proxy(
+        self,
+        project_id: str,
+        token_id: Optional[int] = None,
+    ) -> Optional[str]:
         for attempt in range(2):
             self._mark_runtime_active()
             # 确保浏览器已初始化
@@ -11320,23 +11477,27 @@ class BrowserCaptchaService:
         """
         if not project_ids:
             return []
-        warmed: list[Optional[str]] = []
-        for pid in project_ids:
-            if len(warmed) >= limit:
-                break
-            try:
-                _slot_id, _info = await self._ensure_resident_tab(
-                    project_id=pid,
-                    force_create=False,
-                    return_slot_key=True,
-                )
-                if _slot_id:
-                    warmed.append(_slot_id)
-            except Exception:
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] warmup_resident_tabs 预热 project={pid} 失败",
-                )
-        return warmed
+        await self._enter_default_proxy_mode()
+        try:
+            warmed: list[Optional[str]] = []
+            for pid in project_ids:
+                if len(warmed) >= limit:
+                    break
+                try:
+                    _slot_id, _info = await self._ensure_resident_tab(
+                        project_id=pid,
+                        force_create=False,
+                        return_slot_key=True,
+                    )
+                    if _slot_id:
+                        warmed.append(_slot_id)
+                except Exception:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] warmup_resident_tabs 预热 project={pid} 失败",
+                    )
+            return warmed
+        finally:
+            await self._exit_default_proxy_mode()
 
     # ========== 状态查询 ==========
 
@@ -13079,7 +13240,12 @@ class _PersonalBrowserPoolService:
                         return warmed_slots
         return warmed_slots
 
-    async def refresh_session_token(self, project_id: str, token_id: Optional[int] = None) -> Optional[str]:
+    async def refresh_session_token(
+        self,
+        project_id: str,
+        token_id: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
+    ) -> Optional[str]:
         await self._ensure_workers()
         excluded_indexes: set[int] = set()
         max_attempts = min(len(self._workers), 3)
@@ -13094,7 +13260,11 @@ class _PersonalBrowserPoolService:
                     excluded_indexes=excluded_indexes,
                 )
                 excluded_indexes.add(worker_index)
-                session_token = await worker.refresh_session_token(project_id, token_id=token_id)
+                session_token = await worker.refresh_session_token(
+                    project_id,
+                    token_id=token_id,
+                    account_proxy_url=account_proxy_url,
+                )
             except Exception as e:
                 worker_label = worker_index + 1 if worker_index is not None else "unknown"
                 debug_logger.log_warning(
@@ -13235,7 +13405,13 @@ class _PersonalBrowserPoolService:
             "token_pool_expired_count": int(self._token_pool_stats.get("expired_count", 0) or 0),
         }
 
-    def get_last_fingerprint(self) -> Optional[Dict[str, Any]]:
+    def get_last_fingerprint(self, token_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        worker_index = self._find_worker_index_for_token(token_id)
+        if worker_index is not None and 0 <= worker_index < len(self._workers):
+            fingerprint = self._workers[worker_index].get_last_fingerprint(token_id=token_id)
+            if fingerprint:
+                return fingerprint
+            return None
         if self._last_successful_worker_index is not None and 0 <= self._last_successful_worker_index < len(self._workers):
             fingerprint = self._workers[self._last_successful_worker_index].get_last_fingerprint()
             if fingerprint:
@@ -13245,6 +13421,15 @@ class _PersonalBrowserPoolService:
             if fingerprint:
                 return fingerprint
         return None
+
+    def get_token_fingerprint(self, token_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        worker_index = self._find_worker_index_for_token(token_id)
+        if worker_index is None or not (0 <= worker_index < len(self._workers)):
+            return None
+        get_token_fingerprint = getattr(self._workers[worker_index], "get_token_fingerprint", None)
+        if callable(get_token_fingerprint):
+            return get_token_fingerprint(token_id=token_id)
+        return self._workers[worker_index].get_last_fingerprint()
 
     async def get_custom_token(
         self,

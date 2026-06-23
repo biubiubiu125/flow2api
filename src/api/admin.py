@@ -1,5 +1,6 @@
 """Admin API routes"""
 import asyncio
+import base64
 import json
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
@@ -488,6 +489,7 @@ class AddTokenRequest(BaseModel):
     project_name: Optional[str] = None
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
+    account_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
     image_enabled: bool = True
     video_enabled: bool = True
@@ -501,6 +503,7 @@ class UpdateTokenRequest(BaseModel):
     project_name: Optional[str] = None
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
+    account_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
     image_enabled: Optional[bool] = None
     video_enabled: Optional[bool] = None
@@ -560,6 +563,11 @@ class UpdateAdminConfigRequest(BaseModel):
 class ST2ATRequest(BaseModel):
     """ST转AT请求"""
     st: str
+    account_proxy_url: Optional[str] = None
+    token_id: Optional[int] = None
+    email: Optional[str] = None
+    extension_route_key: Optional[str] = None
+    route_key: Optional[str] = None
 
 
 class ImportTokenItem(BaseModel):
@@ -569,6 +577,7 @@ class ImportTokenItem(BaseModel):
     session_token: Optional[str] = None
     is_active: bool = True
     captcha_proxy_url: Optional[str] = None
+    account_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
     image_enabled: bool = True
     video_enabled: bool = True
@@ -579,6 +588,139 @@ class ImportTokenItem(BaseModel):
 class ImportTokensRequest(BaseModel):
     """导入Token请求"""
     tokens: List[ImportTokenItem]
+
+
+def _decode_email_from_st(st: Optional[str]) -> Optional[str]:
+    """从 JWT 格式的 Session Token 中解析邮箱，仅用于 ST->AT 后一致性校验。"""
+    token_value = str(st or "").strip()
+    parts = token_value.split(".")
+    if len(parts) < 2:
+        return None
+
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
+        data = json.loads(decoded.decode("utf-8"))
+    except Exception:
+        return None
+
+    for key in ("email", "user_email"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    user = data.get("user")
+    if isinstance(user, dict):
+        value = user.get("email")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return None
+
+
+async def _find_token_by_verified_identity_hints(
+    email: str,
+    token_id: Optional[Any] = None,
+    extension_route_key: Optional[str] = None,
+    route_key: Optional[str] = None,
+):
+    """校验 token_id / route_key 是否确实属于指定邮箱。"""
+    request_email = str(email or "").strip()
+    if not request_email:
+        return None
+
+    token_candidate = None
+    if token_id is not None:
+        try:
+            token_candidate = await db.get_token(int(token_id))
+            if token_candidate:
+                if token_candidate.email != request_email:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"token_id 匹配到的 Token 邮箱({token_candidate.email})"
+                            f"与账号邮箱({request_email})不一致"
+                        )
+                    )
+        except (TypeError, ValueError):
+            pass
+
+    route_candidate = None
+    request_route_key = str(extension_route_key or route_key or "").strip()
+    if request_route_key:
+        route_candidate = await db.get_token_by_extension_route_key(request_route_key)
+        if route_candidate:
+            if route_candidate.email != request_email:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"路由键匹配到的 Token 邮箱({route_candidate.email})"
+                        f"与账号邮箱({request_email})不一致"
+                    )
+                )
+            if token_candidate and token_candidate.id != route_candidate.id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"token_id 匹配到的 Token({token_candidate.email})"
+                        f"与路由键匹配到的 Token({route_candidate.email})不一致"
+                    )
+                )
+
+    return token_candidate or route_candidate
+
+
+async def _find_existing_token_hint(
+    token_id: Optional[Any] = None,
+    extension_route_key: Optional[str] = None,
+    route_key: Optional[str] = None,
+    st: Optional[str] = None,
+):
+    """查找可用于 ST->AT 前代理预选的已有 Token。
+
+    同一个 ST、token_id、route key 可以定位已有账号；邮箱和 ST 载荷邮箱
+    只能用于 ST->AT 后校验，不能用于请求前代理预选。
+    """
+    candidates = []
+
+    request_st = str(st or "").strip()
+    if request_st:
+        existing = await db.get_token_by_st(request_st)
+        if existing:
+            candidates.append(("ST", existing))
+
+    if token_id is not None:
+        try:
+            existing = await db.get_token(int(token_id))
+            if existing:
+                candidates.append(("token_id", existing))
+        except (TypeError, ValueError):
+            pass
+
+    request_route_key = str(extension_route_key or route_key or "").strip()
+    if request_route_key:
+        existing = await db.get_token_by_extension_route_key(request_route_key)
+        if existing:
+            candidates.append(("route_key", existing))
+
+    selected = None
+    selected_source = ""
+    for source, candidate in candidates:
+        if selected is None:
+            selected = candidate
+            selected_source = source
+            continue
+        if selected.id != candidate.id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{selected_source} 匹配到的 Token({selected.email})"
+                    f"与{source} 匹配到的 Token({candidate.email})不一致"
+                )
+            )
+
+    return selected
 
 
 # ========== Auth Middleware ==========
@@ -700,6 +842,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "current_project_id": row.get("current_project_id"),  # 🆕 项目ID
         "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
+        "account_proxy_url": row.get("account_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
         "image_enabled": bool(row.get("image_enabled")),
         "video_enabled": bool(row.get("video_enabled")),
@@ -729,6 +872,7 @@ async def add_token(
             project_name=request.project_name,
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
+            account_proxy_url=request.account_proxy_url.strip() if request.account_proxy_url is not None else None,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
@@ -770,9 +914,32 @@ async def update_token(
     """Update token - 使用ST自动刷新AT"""
     try:
         # 先ST转AT
-        result = await token_manager.flow_client.st_to_at(request.st)
+        existing_token = await token_manager.get_token(token_id)
+        if not existing_token:
+            raise HTTPException(status_code=404, detail="Token不存在")
+        account_proxy_url = (
+            request.account_proxy_url.strip()
+            if request.account_proxy_url is not None
+            else (existing_token.account_proxy_url if existing_token else None)
+        )
+        result = await token_manager.flow_client.st_to_at(
+            request.st,
+            account_proxy_url=account_proxy_url
+        )
         at = result["access_token"]
         expires = result.get("expires")
+        email = result.get("user", {}).get("email")
+
+        if not email:
+            raise HTTPException(status_code=400, detail="无法获取邮箱信息")
+        if existing_token.email != email:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"当前 ST 实际邮箱({email})与正在编辑的 Token 邮箱"
+                    f"({existing_token.email})不一致，已拒绝保存"
+                )
+            )
 
         # 解析过期时间
         from datetime import datetime
@@ -793,6 +960,7 @@ async def update_token(
             project_name=request.project_name,
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
+            account_proxy_url=account_proxy_url,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
@@ -811,6 +979,8 @@ async def update_token(
                 )
 
         return {"success": True, "message": "Token更新成功"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -926,14 +1096,73 @@ async def st_to_at(
 ):
     """Convert Session Token to Access Token (仅转换,不添加到数据库)"""
     try:
-        result = await token_manager.flow_client.st_to_at(request.st)
+        account_proxy_url = (
+            request.account_proxy_url.strip()
+            if request.account_proxy_url is not None
+            else None
+        )
+        account_proxy_url = account_proxy_url or None
+        existing_hint = None
+        decoded_email = _decode_email_from_st(request.st)
+        request_email = str(request.email or "").strip()
+        if account_proxy_url is None:
+            if request_email and decoded_email and request_email != decoded_email:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"请求邮箱({request_email})与ST载荷邮箱({decoded_email})不一致"
+                )
+            existing_hint = await _find_existing_token_hint(
+                token_id=request.token_id,
+                extension_route_key=request.extension_route_key,
+                route_key=request.route_key,
+                st=request.st,
+            )
+            if existing_hint:
+                account_proxy_url = existing_hint.account_proxy_url
+
+        result = await token_manager.flow_client.st_to_at(
+            request.st,
+            account_proxy_url=account_proxy_url
+        )
+        email = result.get("user", {}).get("email")
+
+        if not email:
+            raise HTTPException(status_code=400, detail="无法获取邮箱信息")
+        verified_hint = await _find_token_by_verified_identity_hints(
+            email=email,
+            token_id=request.token_id,
+            extension_route_key=request.extension_route_key,
+            route_key=request.route_key,
+        )
+        if not existing_hint and verified_hint:
+            existing_hint = verified_hint
+        if existing_hint and existing_hint.email != email:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"当前 ST 实际邮箱({email})与匹配到的 Token 邮箱"
+                    f"({existing_hint.email})不一致"
+                )
+            )
+        if request_email and request_email != email:
+            raise HTTPException(
+                status_code=400,
+                detail=f"当前 ST 实际邮箱({email})与请求邮箱({request_email})不一致"
+            )
+        if decoded_email and decoded_email != email:
+            raise HTTPException(
+                status_code=400,
+                detail=f"当前 ST 实际邮箱({email})与ST载荷邮箱({decoded_email})不一致"
+            )
         return {
             "success": True,
             "message": "ST converted to AT successfully",
             "access_token": result["access_token"],
-            "email": result.get("user", {}).get("email"),
+            "email": email,
             "expires": result.get("expires")
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -965,13 +1194,55 @@ async def import_tokens(
 
             # 使用 ST 转 AT 获取用户信息
             try:
-                result = await token_manager.flow_client.st_to_at(st)
+                item_account_proxy_url = item.account_proxy_url.strip() if item.account_proxy_url is not None else None
+                has_explicit_account_proxy = bool(item_account_proxy_url)
+                existing_hint = None
+                request_email = str(item.email or "").strip()
+                request_route_key = str(item.extension_route_key or "").strip()
+                decoded_email = _decode_email_from_st(st)
+                stable_existing_hint = await _find_existing_token_hint(
+                    extension_route_key=item.extension_route_key,
+                    st=st,
+                )
+                if stable_existing_hint:
+                    existing_hint = stable_existing_hint
+                st_to_at_proxy_url = item_account_proxy_url
+                if st_to_at_proxy_url is None and existing_hint:
+                    st_to_at_proxy_url = existing_hint.account_proxy_url
+                result = await token_manager.flow_client.st_to_at(
+                    st,
+                    account_proxy_url=st_to_at_proxy_url
+                )
                 at = result["access_token"]
                 email = result.get("user", {}).get("email")
                 expires = result.get("expires")
 
                 if not email:
                     errors.append(f"第{idx+1}项: 无法获取邮箱信息")
+                    continue
+                verified_hint = await _find_token_by_verified_identity_hints(
+                    email=email,
+                    extension_route_key=item.extension_route_key,
+                )
+                if not existing_hint and verified_hint:
+                    existing_hint = verified_hint
+                if stable_existing_hint and stable_existing_hint.email != email:
+                    errors.append(
+                        f"第{idx+1}项: 路由键或旧ST匹配到的账号邮箱({stable_existing_hint.email})"
+                        f"与当前ST实际邮箱({email})不一致，已跳过"
+                    )
+                    continue
+                if decoded_email and decoded_email != email:
+                    errors.append(
+                        f"第{idx+1}项: ST载荷邮箱({decoded_email})"
+                        f"与当前ST实际邮箱({email})不一致，已跳过"
+                    )
+                    continue
+                if request_email and request_email != email:
+                    errors.append(
+                        f"第{idx+1}项: 导入邮箱({request_email})"
+                        f"与当前ST实际邮箱({email})不一致，已跳过"
+                    )
                     continue
 
                 # 解析过期时间
@@ -987,7 +1258,22 @@ async def import_tokens(
                         pass
 
                 # 使用邮箱检查是否已存在
-                existing = existing_by_email.get(email)
+                existing = existing_hint if existing_hint and existing_hint.email == email else None
+                if not existing and request_route_key:
+                    existing = await token_manager.db.get_token_by_extension_route_key(request_route_key)
+                    if existing and existing.email != email:
+                        existing = None
+                if not existing:
+                    existing = await token_manager.db.get_token_by_st(st)
+                    if existing and existing.email != email:
+                        existing = None
+                if not existing:
+                    existing = existing_by_email.get(email)
+                account_proxy_url = (
+                    item_account_proxy_url
+                    if has_explicit_account_proxy
+                    else (existing.account_proxy_url if existing else st_to_at_proxy_url)
+                )
 
                 if existing:
                     # 更新现有Token
@@ -997,6 +1283,7 @@ async def import_tokens(
                         at=at,
                         at_expires=at_expires,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
+                        account_proxy_url=account_proxy_url,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
@@ -1010,7 +1297,8 @@ async def import_tokens(
                     existing.st = st
                     existing.at = at
                     existing.at_expires = at_expires
-                    existing.captcha_proxy_url = item.captcha_proxy_url
+                    existing.captcha_proxy_url = item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None
+                    existing.account_proxy_url = account_proxy_url
                     existing.extension_route_key = item.extension_route_key
                     existing.image_enabled = item.image_enabled
                     existing.video_enabled = item.video_enabled
@@ -1022,6 +1310,7 @@ async def import_tokens(
                     new_token = await token_manager.add_token(
                         st=st,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
+                        account_proxy_url=account_proxy_url,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
@@ -1035,6 +1324,8 @@ async def import_tokens(
                     existing_by_email[email] = new_token
                     added += 1
 
+            except HTTPException as e:
+                errors.append(f"第{idx+1}项: {e.detail}")
             except Exception as e:
                 errors.append(f"第{idx+1}项: {str(e)}")
 
@@ -2134,9 +2425,43 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     if not session_token:
         raise HTTPException(status_code=400, detail="Missing session_token")
 
+    decoded_email = _decode_email_from_st(session_token)
+    request_email = str(request.get("email") or "").strip()
+    request_account_proxy_url = request.get("account_proxy_url")
+    has_explicit_account_proxy = request_account_proxy_url is not None and str(request_account_proxy_url).strip() != ""
+    explicit_account_proxy_url = (
+        str(request_account_proxy_url).strip()
+        if has_explicit_account_proxy
+        else None
+    )
+    if request_email and decoded_email and request_email != decoded_email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Request email does not match session token payload ({request_email} != {decoded_email})"
+        )
+    existing_token_hint = await _find_existing_token_hint(
+        token_id=request.get("token_id"),
+        extension_route_key=request.get("extension_route_key"),
+        route_key=request.get("route_key"),
+        st=session_token,
+    )
+    request_route_key = str(
+        request.get("extension_route_key")
+        or request.get("route_key")
+        or ""
+    ).strip()
+    account_proxy_url = (
+        explicit_account_proxy_url
+        if has_explicit_account_proxy
+        else (existing_token_hint.account_proxy_url if existing_token_hint else None)
+    )
+
     # Step 1: Convert ST to AT to get user info (including email)
     try:
-        result = await token_manager.flow_client.st_to_at(session_token)
+        result = await token_manager.flow_client.st_to_at(
+            session_token,
+            account_proxy_url=account_proxy_url
+        )
         at = result["access_token"]
         expires = result.get("expires")
         user_info = result.get("user", {})
@@ -2144,6 +2469,32 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
 
         if not email:
             raise HTTPException(status_code=400, detail="Failed to get email from session token")
+        verified_hint = await _find_token_by_verified_identity_hints(
+            email=email,
+            token_id=request.get("token_id"),
+            extension_route_key=request.get("extension_route_key"),
+            route_key=request.get("route_key"),
+        )
+        if not existing_token_hint and verified_hint:
+            existing_token_hint = verified_hint
+        if existing_token_hint and existing_token_hint.email != email:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Session token email does not match matched token "
+                    f"({existing_token_hint.email} != {email})"
+                )
+            )
+        if decoded_email and decoded_email != email:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Session token payload email does not match Flow user ({decoded_email} != {email})"
+            )
+        if request_email and request_email != email:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Request email does not match Flow user ({request_email} != {email})"
+            )
 
         # Parse expiration time
         from datetime import datetime
@@ -2154,11 +2505,18 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             except:
                 pass
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
 
-    # Step 2: Check if token with this email exists
-    existing_token = await db.get_token_by_email(email)
+    # Step 2: Check if token with this email exists.
+    # Prefer the same token used to resolve account_proxy_url, otherwise proxy resolution
+    # and the actual update target can diverge when multiple rows share one email.
+    if existing_token_hint and existing_token_hint.email == email:
+        existing_token = existing_token_hint
+    else:
+        existing_token = await db.get_token_by_email(email)
 
     if existing_token:
         # Update existing token
@@ -2168,7 +2526,9 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 token_id=existing_token.id,
                 st=session_token,
                 at=at,
-                at_expires=at_expires
+                at_expires=at_expires,
+                account_proxy_url=explicit_account_proxy_url if has_explicit_account_proxy else None,
+                extension_route_key=request_route_key or None
             )
 
             # Check if auto-enable is enabled and token is disabled
@@ -2193,7 +2553,9 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
         try:
             new_token = await token_manager.add_token(
                 st=session_token,
-                remark="Added by Chrome Extension"
+                remark="Added by Chrome Extension",
+                account_proxy_url=explicit_account_proxy_url,
+                extension_route_key=request_route_key or None
             )
 
             return {

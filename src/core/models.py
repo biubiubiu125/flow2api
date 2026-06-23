@@ -42,6 +42,7 @@ class Token(BaseModel):
 
     # 打码代理（token 级，可覆盖全局浏览器打码代理）
     captcha_proxy_url: Optional[str] = None
+    account_proxy_url: Optional[str] = None  # account-level Flow request proxy
     extension_route_key: Optional[str] = None
 
     # 429禁用相关

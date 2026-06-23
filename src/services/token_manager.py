@@ -107,7 +107,11 @@ class TokenManager:
     async def _create_project_for_token(self, token: Token, pool_index: int, base_name: Optional[str] = None) -> Project:
         """Create a new pooled project for a token and persist it."""
         project_name = self._build_project_name(pool_index, base_name)
-        project_id = await self.flow_client.create_project(token.st, project_name)
+        project_id = await self.flow_client.create_project(
+            token.st,
+            project_name,
+            account_proxy_url=token.account_proxy_url
+        )
         debug_logger.log_info(
             f"[PROJECT] Created pooled project for token {token.id}: {project_name} ({project_id})"
         )
@@ -210,6 +214,7 @@ class TokenManager:
         image_concurrency: int = -1,
         video_concurrency: int = -1,
         captcha_proxy_url: Optional[str] = None,
+        account_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
     ) -> Token:
         """Add a new token and prepare its pooled projects."""
@@ -219,7 +224,7 @@ class TokenManager:
 
         debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
         try:
-            result = await self.flow_client.st_to_at(st)
+            result = await self.flow_client.st_to_at(st, account_proxy_url=account_proxy_url)
             at = result["access_token"]
             expires = result.get("expires")
             user_info = result.get("user", {})
@@ -235,7 +240,7 @@ class TokenManager:
             raise ValueError(f"ST?AT??: {str(e)}")
 
         try:
-            credits_result = await self.flow_client.get_credits(at)
+            credits_result = await self.flow_client.get_credits(at, account_proxy_url=account_proxy_url)
             credits = credits_result.get("credits", 0)
             user_paygate_tier = credits_result.get("userPaygateTier")
         except Exception:
@@ -258,7 +263,11 @@ class TokenManager:
         else:
             try:
                 first_project_name = self._build_project_name(1, base_project_name)
-                first_project_id = await self.flow_client.create_project(st, first_project_name)
+                first_project_id = await self.flow_client.create_project(
+                    st,
+                    first_project_name,
+                    account_proxy_url=account_proxy_url
+                )
                 debug_logger.log_info(f"[ADD_TOKEN] Created pooled project #1: {first_project_name} (ID: {first_project_id})")
                 pooled_projects.append(Project(
                     project_id=first_project_id,
@@ -286,6 +295,7 @@ class TokenManager:
             image_concurrency=image_concurrency,
             video_concurrency=video_concurrency,
             captcha_proxy_url=captcha_proxy_url,
+            account_proxy_url=account_proxy_url,
             extension_route_key=extension_route_key,
         )
 
@@ -317,6 +327,7 @@ class TokenManager:
         image_concurrency: Optional[int] = None,
         video_concurrency: Optional[int] = None,
         captcha_proxy_url: Optional[str] = None,
+        account_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
     ):
         """Update token (支持修改project_id和project_name)
@@ -347,6 +358,8 @@ class TokenManager:
             update_fields["video_concurrency"] = video_concurrency
         if captcha_proxy_url is not None:
             update_fields["captcha_proxy_url"] = captcha_proxy_url
+        if account_proxy_url is not None:
+            update_fields["account_proxy_url"] = account_proxy_url
         if extension_route_key is not None:
             update_fields["extension_route_key"] = extension_route_key
 
@@ -456,7 +469,11 @@ class TokenManager:
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
                 result = await self._do_refresh_at(token_id, new_st)
                 if result:
+                    await self.db.update_token(token_id, st=new_st)
+                    debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST verified and persisted")
+                    record_token_refresh("st", "success")
                     return True
+                record_token_refresh("st", "failure")
 
             debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
             await self.disable_token(token_id)
@@ -481,67 +498,66 @@ class TokenManager:
         return await task
 
     async def _do_refresh_at(self, token_id: int, st: str) -> bool:
-        """执行 AT 刷新的核心逻辑
-
-        Args:
-            token_id: Token ID
-            st: Session Token
-
-        Returns:
-            True if refresh successful AND AT is valid, False otherwise
-        """
+        """Refresh AT and persist it only after validation succeeds."""
         try:
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 开始刷新AT...")
+            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: starting AT refresh...")
 
-            # 使用ST转AT
-            result = await self.flow_client.st_to_at(st)
+            token = await self.db.get_token(token_id)
+            account_proxy_url = token.account_proxy_url if token else None
+            result = await self.flow_client.st_to_at(
+                st,
+                account_proxy_url=account_proxy_url,
+            )
             new_at = result["access_token"]
             expires = result.get("expires")
+            email = result.get("user", {}).get("email")
+            if token and email and token.email != email:
+                debug_logger.log_error(
+                    f"[AT_REFRESH] Token {token_id}: ST email mismatch "
+                    f"({token.email} != {email}), refusing refresh"
+                )
+                record_token_refresh("at", "failure")
+                return False
+            if token and not email:
+                debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: AT email missing, refusing refresh")
+                record_token_refresh("at", "failure")
+                return False
 
-            # 解析过期时间
             new_at_expires = None
             if expires:
                 try:
                     new_at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-                except:
+                except Exception:
                     pass
 
-            # 更新数据库
-            await self.db.update_token(
-                token_id,
-                at=new_at,
-                at_expires=new_at_expires
-            )
-
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功")
-            debug_logger.log_info(f"  - 新过期时间: {new_at_expires}")
-
-            # 验证 AT 有效性：通过 get_credits 测试
             try:
-                credits_result = await self.flow_client.get_credits(new_at)
+                credits_result = await self.flow_client.get_credits(
+                    new_at,
+                    account_proxy_url=account_proxy_url,
+                )
                 await self.db.update_token(
                     token_id,
+                    at=new_at,
+                    at_expires=new_at_expires,
                     credits=credits_result.get("credits", 0),
                     user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
-                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
+                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT refresh succeeded")
+                debug_logger.log_info(f"  - New expiry: {new_at_expires}")
+                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT validation succeeded (credits: {credits_result.get('credits', 0)})")
                 record_token_refresh("at", "success")
                 return True
             except Exception as verify_err:
-                # AT 验证失败（可能返回 401），说明 ST 已过期
                 error_msg = str(verify_err)
                 if "401" in error_msg or "UNAUTHENTICATED" in error_msg:
-                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证失败 (401)，ST 可能已过期")
-                    record_token_refresh("at", "failure")
-                    return False
+                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT validation failed (401), ST may be expired")
                 else:
-                    # 其他错误（如网络问题），仍视为成功
-                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {error_msg}")
-                    record_token_refresh("at", "success")
-                    return True
+                    debug_logger.log_warning(f"[AT_REFRESH] Token {token_id}: AT validation failed, new AT was not persisted: {error_msg}")
+                record_token_refresh("at", "failure")
+                return False
 
         except Exception as e:
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: AT刷新失败 - {str(e)}")
+            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: AT refresh failed - {str(e)}")
             record_token_refresh("at", "failure")
             return False
 
@@ -577,7 +593,11 @@ class TokenManager:
             refresh_timeout_seconds = 45.0
             try:
                 new_st = await asyncio.wait_for(
-                    service.refresh_session_token(token.current_project_id),
+                    service.refresh_session_token(
+                        token.current_project_id,
+                        token_id=token_id,
+                        account_proxy_url=token.account_proxy_url,
+                    ),
                     timeout=refresh_timeout_seconds,
                 )
             except asyncio.TimeoutError:
@@ -587,10 +607,7 @@ class TokenManager:
                 record_token_refresh("st", "failure")
                 return None
             if new_st and new_st != token.st:
-                # 更新数据库中的 ST
-                await self.db.update_token(token_id, st=new_st)
-                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST 已自动更新")
-                record_token_refresh("st", "success")
+                debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: ST refreshed, waiting for AT verification before persisting")
                 return new_st
             elif new_st == token.st:
                 debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 获取到的 ST 与原 ST 相同，可能登录已失效")
@@ -762,7 +779,10 @@ class TokenManager:
             return 0
 
         try:
-            result = await self.flow_client.get_credits(token.at)
+            result = await self.flow_client.get_credits(
+                token.at,
+                account_proxy_url=token.account_proxy_url
+            )
             credits = result.get("credits", 0)
             user_paygate_tier = result.get("userPaygateTier")
 

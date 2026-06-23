@@ -8,7 +8,7 @@ import random
 import base64
 import ssl
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
@@ -113,10 +113,8 @@ class FlowClient:
         use_at: bool = False,
         at_token: Optional[str] = None,
         timeout: Optional[int] = None,
-        use_media_proxy: bool = False,
-        respect_fingerprint_proxy: bool = True,
-        force_no_proxy: bool = False,
-        allow_urllib_fallback: bool = True
+        allow_urllib_fallback: bool = True,
+        account_proxy_url: Optional[str] = None
     ) -> Dict[str, Any]:
         """统一HTTP请求处理
 
@@ -130,26 +128,21 @@ class FlowClient:
             use_at: 是否使用AT认证 (Bearer方式)
             at_token: Access Token
             timeout: 自定义超时时间(秒)，不传则使用默认值
-            use_media_proxy: 是否使用图片上传/下载代理
-            respect_fingerprint_proxy: 是否优先使用打码浏览器指纹里的代理
             allow_urllib_fallback: curl_cffi 网络失败时是否允许 urllib 二次兜底
+            account_proxy_url: 账号级 Flow 请求代理，空值时回退全局请求代理
         """
         fingerprint = self._request_fingerprint_ctx.get()
 
         proxy_url = None
-        if not force_no_proxy:
-            if self.proxy_manager:
-                if use_media_proxy and hasattr(self.proxy_manager, "get_media_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_media_proxy_url()
-                elif hasattr(self.proxy_manager, "get_request_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                else:
-                    proxy_url = await self.proxy_manager.get_proxy_url()
-
-            if respect_fingerprint_proxy and isinstance(fingerprint, dict) and "proxy_url" in fingerprint:
-                proxy_url = fingerprint.get("proxy_url")
-                if proxy_url == "":
-                    proxy_url = None
+        if self.proxy_manager:
+            if account_proxy_url and hasattr(self.proxy_manager, "resolve_account_proxy_url"):
+                proxy_url = await self.proxy_manager.resolve_account_proxy_url(account_proxy_url)
+            elif account_proxy_url:
+                proxy_url = account_proxy_url.strip()
+            elif hasattr(self.proxy_manager, "get_request_proxy_url"):
+                proxy_url = await self.proxy_manager.get_request_proxy_url()
+            else:
+                proxy_url = await self.proxy_manager.get_proxy_url()
         request_timeout = timeout or self.timeout
 
         if headers is None:
@@ -216,7 +209,7 @@ class FlowClient:
         # Log request
         if config.debug_enabled:
             if isinstance(fingerprint, dict):
-                proxy_for_log = proxy_url if proxy_url else "direct"
+                proxy_for_log = debug_logger.mask_proxy_url(proxy_url) if proxy_url else "direct"
                 debug_logger.log_info(
                     f"[FINGERPRINT] 使用打码浏览器指纹提交请求: UA={headers.get('User-Agent', '')[:120]}, proxy={proxy_for_log}"
                 )
@@ -302,6 +295,12 @@ class FlowClient:
                 debug_logger.log_error(f"[API FAILED] Exception: {error_msg}")
 
             if allow_urllib_fallback and self._should_fallback_to_urllib(error_msg):
+                if not self._can_urllib_use_proxy(proxy_url):
+                    debug_logger.log_warning(
+                        "[HTTP FALLBACK] urllib does not support this proxy scheme; skip fallback "
+                        f"for {method.upper()} {url}"
+                    )
+                    raise Exception(f"Flow API request failed: {error_msg}")
                 debug_logger.log_warning(
                     f"[HTTP FALLBACK] curl_cffi 请求失败，回退 urllib: {method.upper()} {url}"
                 )
@@ -345,6 +344,15 @@ class FlowClient:
                 "network is unreachable",
             ]
         )
+
+    def _can_urllib_use_proxy(self, proxy_url: Optional[str]) -> bool:
+        if not proxy_url:
+            return True
+        try:
+            scheme = urlsplit(str(proxy_url).strip()).scheme.lower()
+        except Exception:
+            return False
+        return scheme in ("http", "https")
 
     def _sync_json_request_via_urllib(
         self,
@@ -472,6 +480,7 @@ class FlowClient:
         json_data: Dict[str, Any],
         at: str,
         timeout: int,
+        account_proxy_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """视频 API 加硬截止，避免 curl_cffi 底层偶发卡住导致整条请求悬挂。"""
         try:
@@ -483,7 +492,8 @@ class FlowClient:
                     use_at=True,
                     at_token=at,
                     timeout=timeout,
-                    allow_urllib_fallback=False
+                    allow_urllib_fallback=False,
+                    account_proxy_url=account_proxy_url
                 ),
                 timeout=timeout + 5
             )
@@ -519,47 +529,17 @@ class FlowClient:
         url: str,
         json_data: Dict[str, Any],
         at: str,
-        attempt_trace: Optional[Dict[str, Any]] = None
+        attempt_trace: Optional[Dict[str, Any]] = None,
+        account_proxy_url: Optional[str] = None
     ) -> Dict[str, Any]:
         """图片生成请求使用更短超时，并在网络超时时快速重试。"""
         request_timeout = config.flow_image_request_timeout
         total_attempts = max(1, config.flow_image_timeout_retry_count + 1)
         retry_delay = config.flow_image_timeout_retry_delay
-
-        # 对于浏览器/远程浏览器打码链路，优先保持与打码时一致的出口。
-        # 否则在首跳改走媒体代理时，容易触发 reCAPTCHA 校验失败并放大长尾。
-        fingerprint = self._request_fingerprint_ctx.get()
-        has_fingerprint_context = bool(isinstance(fingerprint, dict) and fingerprint)
-
-        has_media_proxy = False
-        if self.proxy_manager and config.flow_image_timeout_use_media_proxy_fallback:
-            try:
-                has_media_proxy = bool(await self.proxy_manager.get_media_proxy_url())
-            except Exception:
-                has_media_proxy = False
-        prefer_media_first = bool(has_media_proxy and config.flow_image_prefer_media_proxy)
-
-        if has_fingerprint_context and prefer_media_first:
-            prefer_media_first = False
-            debug_logger.log_info(
-                "[IMAGE] 检测到打码浏览器指纹上下文，首跳固定走打码链路；"
-                "媒体代理仅在网络超时时作为兜底回退。"
-            )
-
+        route_label = "账号代理链路" if str(account_proxy_url or "").strip() else "全局请求代理链路"
         last_error: Optional[Exception] = None
 
         for attempt_index in range(total_attempts):
-            if has_media_proxy:
-                # 两次重试时采用“主链路 + 备链路”策略，避免每次都先卡在错误链路上。
-                if attempt_index == 0:
-                    prefer_media_proxy = prefer_media_first
-                elif attempt_index == 1:
-                    prefer_media_proxy = not prefer_media_first
-                else:
-                    prefer_media_proxy = prefer_media_first
-            else:
-                prefer_media_proxy = False
-            route_label = "媒体代理链路" if prefer_media_proxy else "打码链路"
             http_attempt_started_at = time.time()
             http_attempt_info: Optional[Dict[str, Any]] = None
             if isinstance(attempt_trace, dict):
@@ -567,8 +547,8 @@ class FlowClient:
                     "attempt": attempt_index + 1,
                     "route": route_label,
                     "timeout_seconds": request_timeout,
-                    "used_media_proxy": bool(prefer_media_proxy),
                 }
+
             try:
                 result = await self._make_request(
                     method="POST",
@@ -577,8 +557,7 @@ class FlowClient:
                     use_at=True,
                     at_token=at,
                     timeout=request_timeout,
-                    use_media_proxy=prefer_media_proxy,
-                    respect_fingerprint_proxy=not prefer_media_proxy,
+                    account_proxy_url=account_proxy_url,
                 )
                 if http_attempt_info is not None:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
@@ -596,17 +575,10 @@ class FlowClient:
                 if not self._is_timeout_error(e) or attempt_index >= total_attempts - 1:
                     raise
 
-                if has_media_proxy and total_attempts > 1:
-                    next_prefer_media_proxy = (
-                        not prefer_media_proxy if attempt_index == 0 else prefer_media_proxy
-                    )
-                else:
-                    next_prefer_media_proxy = prefer_media_proxy
-                next_route_label = "媒体代理链路" if next_prefer_media_proxy else "打码链路"
                 debug_logger.log_warning(
                     f"[IMAGE] 图片生成请求网络超时，准备快速重试 "
                     f"({attempt_index + 2}/{total_attempts})，当前链路={route_label}，"
-                    f"下一链路={next_route_label}，timeout={request_timeout}s"
+                    f"下一链路={route_label}，timeout={request_timeout}s"
                 )
                 if retry_delay > 0:
                     await asyncio.sleep(retry_delay)
@@ -615,9 +587,7 @@ class FlowClient:
             raise last_error
         raise RuntimeError("图片生成请求失败")
 
-    # ========== 认证相关 (使用ST) ==========
-
-    async def st_to_at(self, st: str) -> dict:
+    async def st_to_at(self, st: str, account_proxy_url: Optional[str] = None) -> dict:
         """ST转AT
 
         Args:
@@ -638,26 +608,19 @@ class FlowClient:
                 use_st=True,
                 st_token=st,
                 timeout=self._get_control_plane_timeout(),
+                account_proxy_url=account_proxy_url,
             )
         except Exception as e:
-            if not self._is_proxy_connection_error(e):
-                raise
-
-            debug_logger.log_warning(
-                f"[AUTH] ST->AT failed via configured proxy, retrying direct connection: {e}"
-            )
-            return await self._make_request(
-                method="GET",
-                url=url,
-                use_st=True,
-                st_token=st,
-                timeout=self._get_control_plane_timeout(),
-                force_no_proxy=True,
-            )
+            raise
 
     # ========== 项目管理 (使用ST) ==========
 
-    async def create_project(self, st: str, title: str) -> str:
+    async def create_project(
+        self,
+        st: str,
+        title: str,
+        account_proxy_url: Optional[str] = None
+    ) -> str:
         """创建项目,返回project_id
 
         Args:
@@ -687,6 +650,7 @@ class FlowClient:
                     use_st=True,
                     st_token=st,
                     timeout=request_timeout,
+                    account_proxy_url=account_proxy_url,
                 )
                 project_result = (
                     result.get("result", {})
@@ -714,7 +678,12 @@ class FlowClient:
             raise last_error
         raise RuntimeError("创建项目失败")
 
-    async def delete_project(self, st: str, project_id: str):
+    async def delete_project(
+        self,
+        st: str,
+        project_id: str,
+        account_proxy_url: Optional[str] = None
+    ):
         """删除项目
 
         Args:
@@ -735,11 +704,16 @@ class FlowClient:
             use_st=True,
             st_token=st,
             timeout=self._get_control_plane_timeout(),
+            account_proxy_url=account_proxy_url,
         )
 
     # ========== 余额查询 (使用AT) ==========
 
-    async def get_credits(self, at: str) -> dict:
+    async def get_credits(
+        self,
+        at: str,
+        account_proxy_url: Optional[str] = None
+    ) -> dict:
         """查询余额
 
         Args:
@@ -758,6 +732,7 @@ class FlowClient:
             use_at=True,
             at_token=at,
             timeout=self._get_control_plane_timeout(),
+            account_proxy_url=account_proxy_url,
         )
         return result
 
@@ -822,7 +797,9 @@ class FlowClient:
         at: str,
         image_bytes: bytes,
         aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        project_id: Optional[str] = None
+        project_id: Optional[str] = None,
+        account_proxy_url: Optional[str] = None,
+        token_id: Optional[int] = None
     ) -> str:
         """上传图片,返回mediaId
 
@@ -891,12 +868,17 @@ class FlowClient:
             try:
                 from .browser_captcha_personal import BrowserCaptchaService
                 service = await BrowserCaptchaService.get_instance(self.db)
-                fingerprint = service.get_last_fingerprint()
-                if not fingerprint:
-                    await service.get_token(project_id, "uploadUserImage")
-                    fingerprint = service.get_last_fingerprint()
+                self._set_request_fingerprint(None)
+                token = await service.get_token(project_id, "uploadUserImage", token_id=token_id)
+                get_token_fingerprint = getattr(service, "get_token_fingerprint", None)
+                fingerprint = (
+                    get_token_fingerprint(token_id=token_id)
+                    if token and callable(get_token_fingerprint)
+                    else (service.get_last_fingerprint() if token else None)
+                )
                 self._set_request_fingerprint(fingerprint)
             except Exception as e:
+                self._set_request_fingerprint(None)
                 debug_logger.log_error(f"[UPLOAD] Failed to pre-fetch fingerprint: {e}")
 
         for retry_attempt in range(max_retries):
@@ -907,7 +889,7 @@ class FlowClient:
                     json_data=new_json_data,
                     use_at=True,
                     at_token=at,
-                    use_media_proxy=True
+                    account_proxy_url=account_proxy_url
                 )
                 media_id = (
                     self._extract_media_name(new_result.get("media"))
@@ -946,7 +928,7 @@ class FlowClient:
                     json_data=legacy_json_data,
                     use_at=True,
                     at_token=at,
-                    use_media_proxy=True
+                    account_proxy_url=account_proxy_url
                 )
 
                 media_id = (
@@ -984,6 +966,7 @@ class FlowClient:
         token_id: Optional[int] = None,
         token_image_concurrency: Optional[int] = None,
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
+        account_proxy_url: Optional[str] = None,
     ) -> tuple[dict, str, Dict[str, Any]]:
         """生成图片(同步返回)
 
@@ -1108,6 +1091,7 @@ class FlowClient:
                     json_data=json_data,
                     at=at,
                     attempt_trace=attempt_trace,
+                    account_proxy_url=account_proxy_url,
                 )
                 attempt_trace["success"] = True
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
@@ -1146,7 +1130,8 @@ class FlowClient:
         target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K",
         user_paygate_tier: str = "PAYGATE_TIER_NOT_PAID",
         session_id: Optional[str] = None,
-        token_id: Optional[int] = None
+        token_id: Optional[int] = None,
+        account_proxy_url: Optional[str] = None
     ) -> str:
         """放大图片到 2K/4K
 
@@ -1211,7 +1196,8 @@ class FlowClient:
                     json_data=json_data,
                     use_at=True,
                     at_token=at,
-                    timeout=config.upsample_timeout
+                    timeout=config.upsample_timeout,
+                    account_proxy_url=account_proxy_url
                 )
 
                 # 返回 base64 编码的图片
@@ -1472,6 +1458,7 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """文生视频,返回task_id
 
@@ -1566,7 +1553,8 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    account_proxy_url=account_proxy_url
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -1599,6 +1587,7 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """图生视频,返回task_id
 
@@ -1693,7 +1682,8 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    account_proxy_url=account_proxy_url
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -1728,6 +1718,7 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """收尾帧生成视频,返回task_id
 
@@ -1823,7 +1814,8 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    account_proxy_url=account_proxy_url
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -1857,6 +1849,7 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """仅首帧生成视频,返回task_id
 
@@ -1949,7 +1942,8 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    account_proxy_url=account_proxy_url
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -1984,6 +1978,7 @@ class FlowClient:
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """视频续写,基于已生成的视频延伸7秒
 
@@ -2081,7 +2076,8 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    account_proxy_url=account_proxy_url
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -2110,6 +2106,7 @@ class FlowClient:
         at: str,
         original_media_id: str,
         extend_media_id: str,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """
         调用 Google runVideoFxConcatenation API 拼接视频
@@ -2148,7 +2145,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_at=True,
-            at_token=at
+            at_token=at,
+            account_proxy_url=account_proxy_url
         )
         debug_logger.log_info(f"[CONCAT] 拼接任务已提交: {json.dumps(result, ensure_ascii=False)[:300]}")
         return result
@@ -2159,6 +2157,7 @@ class FlowClient:
         operation_name: str,
         timeout: int = 300,
         poll_interval: int = 3,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """
         轮询拼接任务状态，直到完成或超时
@@ -2191,6 +2190,7 @@ class FlowClient:
                 use_at=True,
                 at_token=at,
                 timeout=300,  # concat API returns base64 video (~14MB), needs longer timeout
+                account_proxy_url=account_proxy_url,
             )
             
             status = result.get("status", "")
@@ -2261,6 +2261,7 @@ class FlowClient:
         model_key: str,
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
+        account_proxy_url: Optional[str] = None,
     ) -> dict:
         """视频放大到 4K/1080P，返回 task_id
 
@@ -2345,7 +2346,8 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_submit_timeout()
+                    timeout=self._get_video_submit_timeout(),
+                    account_proxy_url=account_proxy_url
                 )
                 return self._normalize_video_generation_response(result, fallback_project_id=project_id)
             except Exception as e:
@@ -2368,7 +2370,12 @@ class FlowClient:
 
     # ========== 任务轮询 (使用AT) ==========
 
-    async def check_video_status(self, at: str, operations: List[Dict]) -> dict:
+    async def check_video_status(
+        self,
+        at: str,
+        operations: List[Dict],
+        account_proxy_url: Optional[str] = None
+    ) -> dict:
         """查询视频生成状态
 
         Args:
@@ -2399,7 +2406,8 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_poll_timeout()
+                    timeout=self._get_video_poll_timeout(),
+                    account_proxy_url=account_proxy_url
                 )
                 return self._normalize_video_generation_response(result)
             except Exception as e:
@@ -2409,7 +2417,8 @@ class FlowClient:
                             url=url,
                             json_data={"operations": operations},
                             at=at,
-                            timeout=self._get_video_poll_timeout()
+                            timeout=self._get_video_poll_timeout(),
+                            account_proxy_url=account_proxy_url
                         )
                         return self._normalize_video_generation_response(result)
                     except Exception:
@@ -2430,7 +2439,12 @@ class FlowClient:
 
     # ========== 媒体删除 (使用ST) ==========
 
-    async def delete_media(self, st: str, media_names: List[str]):
+    async def delete_media(
+        self,
+        st: str,
+        media_names: List[str],
+        account_proxy_url: Optional[str] = None
+    ):
         """删除媒体
 
         Args:
@@ -2449,7 +2463,8 @@ class FlowClient:
             url=url,
             json_data=json_data,
             use_st=True,
-            st_token=st
+            st_token=st,
+            account_proxy_url=account_proxy_url
         )
 
     # ========== 辅助方法 ==========
@@ -2910,7 +2925,12 @@ class FlowClient:
                 else:
                     token = await service.get_token(project_id, action, token_id=token_id)
                 debug_logger.log_info(f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}...")
-                fingerprint = service.get_last_fingerprint() if token else None
+                get_token_fingerprint = getattr(service, "get_token_fingerprint", None)
+                fingerprint = (
+                    get_token_fingerprint(token_id=token_id)
+                    if token and callable(get_token_fingerprint)
+                    else (service.get_last_fingerprint() if token else None)
+                )
                 self._set_request_fingerprint(fingerprint if token else None)
                 return token, None
             except RuntimeError as e:
